@@ -1,7 +1,7 @@
-package com.tibbo.aggregate.dev.jarscan;
+package pro.toparvion.util.jarscan;
 
 import static java.util.Arrays.asList;
-import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.collectingAndThen;
 import static java.util.stream.Collectors.toMap;
 
 import com.eclipsesource.json.Json;
@@ -25,11 +25,15 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipFile;
 import picocli.CommandLine;
@@ -37,18 +41,16 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
-@Command(name = "scanner", version = "JAR Sign Scanner 1.0", mixinStandardHelpOptions = true)
-public class Scanner implements Runnable {
+@Command(name = "scanner", version = "JAR Sign Scanner 1.1", mixinStandardHelpOptions = true)
+public class Scanner implements Callable<Integer> {
 
-    private static final int STANDARD_TERMINAL_WIDTH = 80;
-    
     @Parameters(paramLabel = "paths", description = "JAR files and folders to scan.", defaultValue = ".")
     private String[] args = {"."};
     
     @Option(names = {"-n", "--no-recurse"}, description = "Deny recursive directory traversing.")
     private boolean noRecursion = false;
 
-    @Option(names = {"-v", "--verbose"}, description = "Print error details (stack traces).")
+    @Option(names = {"-v", "--verbose"}, description = "Print process details (including stack traces).")
     private boolean verbose = false;
 
     @Option(names = {"-s", "--show"}, split = ",", description = "Output filter: signed/unsigned/unknown (default: all).", paramLabel = "option")
@@ -60,33 +62,52 @@ public class Scanner implements Runnable {
     @Option(names = {"-p", "--pretty"}, description = "Pretty print JSON output.")
     private boolean pretty = false;
 
+    private final AtomicLong progressCounter = new AtomicLong(1);
+
     public static void main(String[] args) {
         int exitCode = new CommandLine(new Scanner()).execute(args);
         System.exit(exitCode);
     }
 
     @Override
-    public void run() {
+    public Integer call() {
+        var startTime = System.currentTimeMillis();
         List<Path> filesToCheck = collectFilesToCheck(args);
         if (filesToCheck.isEmpty()) {
             System.err.println("No JAR files found within specified path(s).");
-            return;
+            return 1;
         }
 
+        Map<Path, CheckResult> path2Result;
+        int total = filesToCheck.size();
+        if (total > 10 && output == OutputOption.text) {
+            Timer timer = new Timer("ProgressTimer", true);
+            timer.scheduleAtFixedRate(new TimerTask() {
+                @Override
+                public void run() {
+                    printProgress(startTime, total);
+                }
+            }, 0, 250);
+        }
         System.out.println();
-        Map<Path, CheckResult> path2Result = filesToCheck.stream()
-                .peek(this::printCurrentPath)
+        path2Result = filesToCheck.stream()
+                .parallel()
                 .map(this::checkForSignature)
-                .collect(Collectors.collectingAndThen(toMap(CheckResult::getPath, Function.identity()), TreeMap::new));
-        System.out.println("\r\n");
+                .collect(collectingAndThen(
+                        toMap(CheckResult::path, Function.identity()),
+                        TreeMap::new));
+        if (output == OutputOption.text) {
+            System.out.println("\n");
+        }
 
         if (output == OutputOption.json) {
             composeResultsJson(path2Result);
         } else {
             printCheckResults(path2Result);
-            printStats(path2Result);
+            printStats(path2Result, startTime);
         }
-
+        
+        return 0;
     }
     private List<Path> collectFilesToCheck(String[] args) {
         if (args.length < 1) {
@@ -105,7 +126,7 @@ public class Scanner implements Runnable {
                     try (Stream<Path> stream = Files.walk(givenPath, walkDepth)) {
                         List<Path> jarPaths = stream.filter(Files::isRegularFile)
                                 .filter(file -> file.getFileName().toString().toLowerCase().endsWith(".jar"))
-                                .collect(toList());
+                                .toList();
                         filesToCheck.addAll(jarPaths);
                     }
                 } else {
@@ -121,6 +142,9 @@ public class Scanner implements Runnable {
                     e.printStackTrace(System.err);
                 }
             }
+        }
+        if (verbose && output == OutputOption.text) {
+            System.out.printf("Found %d JAR eligible files to scan\n", filesToCheck.size());
         }
         return filesToCheck;
     }
@@ -154,6 +178,8 @@ public class Scanner implements Runnable {
                 e.printStackTrace(System.err);
             }
             return CheckResult.fail(jarPath, e.getMessage());
+        } finally {
+            progressCounter.incrementAndGet();
         }
     }
 
@@ -169,16 +195,32 @@ public class Scanner implements Runnable {
             }
         }
     }
-    
-    private void printCurrentPath(Path path) {
-        if (output != OutputOption.text) {
-            return;
-        }
-        StringBuilder sb = new StringBuilder("\rScanning ")
-                .append(path).append("...");
-        int curLength = sb.length() - 1;
-        sb.append(fillSpaces((STANDARD_TERMINAL_WIDTH - curLength)));
-        System.out.print(sb);
+
+    /**
+     * @see <a href="https://stackoverflow.com/a/39257969/3507435">Source</a>
+     */
+    private void printProgress(long startTime, long total) {
+        long current = progressCounter.get();
+        long eta = current == 0 ? 0 :
+                (total - current) * (System.currentTimeMillis() - startTime) / current;
+
+        String etaHms = current == 0 ? "N/A" :
+                String.format("%02d:%02d:%02d", TimeUnit.MILLISECONDS.toHours(eta),
+                        TimeUnit.MILLISECONDS.toMinutes(eta) % TimeUnit.HOURS.toMinutes(1),
+                        TimeUnit.MILLISECONDS.toSeconds(eta) % TimeUnit.MINUTES.toSeconds(1));
+
+        int percent = (int) (current * 100 / total);
+        String string = '\r' +
+                String.join("", Collections.nCopies(percent == 0 ? 2 : 2 - (int) (Math.log10(percent)), " ")) +
+                String.format(" %d%% [", percent) +
+                String.join("", Collections.nCopies(percent, "=")) +
+                '>' +
+                String.join("", Collections.nCopies(100 - percent, " ")) +
+                ']' +
+                String.join("", Collections.nCopies((int) (Math.log10(total)) - (int) (Math.log10(current)), " ")) +
+                String.format(" %d/%d, ETA: %s", current, total, etaHms);
+
+        System.out.print(string);
     }
     
     private void printCheckResults(Map<Path, CheckResult> results) {
@@ -196,7 +238,7 @@ public class Scanner implements Runnable {
             char[] pathFiller = fillSpaces((maxLength - jarPathString.length()));
 
             if (checkResult.isOk()) {
-                Set<Certificate> certs = checkResult.getCerts();
+                Set<Certificate> certs = checkResult.certs();
                 if (certs.isEmpty()) {
                     if (showOptions.contains(ShowOption.unsigned)) {
                         sb.append(jarPathString).append(pathFiller).append(" | ").append("[UNSIGNED]").append('\n');
@@ -206,12 +248,11 @@ public class Scanner implements Runnable {
                         sb.append(jarPathString).append(pathFiller).append(" | ");
                         int count = 0;
                         for (Certificate cert : certs) {
-                            if (!(cert instanceof X509Certificate)) {
+                            if (!(cert instanceof X509Certificate x509cert)) {
                                 sb.append("Unknown certificate type: ").append(cert.toString());
                             } else {
-                                X509Certificate x509cert = (X509Certificate) cert;
-                                String subject = x509cert.getSubjectDN().toString();
-                                String issuer = x509cert.getIssuerDN().toString();
+                                String subject = x509cert.getSubjectX500Principal().toString();
+                                String issuer = x509cert.getIssuerX500Principal().toString();
                                 boolean isSelfSigned = subject.equals(issuer);
                                 sb.append("Signed: ").append(subject);
                                 if (isSelfSigned) {
@@ -221,7 +262,8 @@ public class Scanner implements Runnable {
                                 }
                             }
                             if (++count < certs.size()) {
-                                sb.append('\n').append("┕").append(fillSpaces((maxLength-1))).append(" | ");
+                                String indent = "  \\-->";
+                                sb.append('\n').append(indent).append(fillSpaces((maxLength-indent.length()))).append(" | ");
                             }
                         }
                         sb.append('\n');
@@ -229,32 +271,33 @@ public class Scanner implements Runnable {
                 }
             } else {
                 if (showOptions.contains(ShowOption.unknown)) {
-                    sb.append(jarPathString).append(pathFiller).append(" | ").append("ERROR: ").append(checkResult.getError()).append('\n');
+                    sb.append(jarPathString).append(pathFiller).append(" | ").append("ERROR: ").append(checkResult.error()).append('\n');
                 }
             }
         }
         System.out.println(sb);
     }
 
-    private void printStats(Map<Path, CheckResult> results) {
+    private void printStats(Map<Path, CheckResult> results, long startTime) {
         if (output != OutputOption.text) {
             return;
         }
         List<CheckResult> successful = results.values().stream()
                 .filter(CheckResult::isOk)
-                .collect(toList());
+                .toList();
         int successFulCount = successful.size();
 
         long notSignedCount = successful.stream()
-                .map(CheckResult::getCerts)
+                .map(CheckResult::certs)
                 .filter(Collection::isEmpty)
                 .count();
 
         long signedCount = successFulCount - notSignedCount;
         long failedCount = results.size() - successFulCount;
 
-        System.out.printf("Total %d JAR files scanned: %d signed, %d not signed, %d unknown.\n",
-                results.size(), signedCount, notSignedCount, failedCount);
+        var tookTime = System.currentTimeMillis() - startTime;
+        System.out.printf("Total %d JAR files scanned (in %dms): %d signed, %d not signed, %d unknown.\n",
+                results.size(), tookTime, signedCount, notSignedCount, failedCount);
     }
 
     private void composeResultsJson(Map<Path, CheckResult> results) {
@@ -264,7 +307,7 @@ public class Scanner implements Runnable {
             CheckResult checkResult = resultEntry.getValue();
 
             if (checkResult.isOk()) {
-                if (checkResult.getCerts().isEmpty()) {
+                if (checkResult.certs().isEmpty()) {
                     if (showOptions.contains(ShowOption.unsigned)) {
                         rootArray.add(new JsonObject()
                                 .add("path", jarPath.toString())
@@ -274,14 +317,13 @@ public class Scanner implements Runnable {
                 } else {
                     if (showOptions.contains(ShowOption.signed)) {
                         JsonArray certsArray = new JsonArray();
-                        for (Certificate cert : checkResult.getCerts()) {
-                            if (!(cert instanceof X509Certificate)) {
+                        for (Certificate cert : checkResult.certs()) {
+                            if (!(cert instanceof X509Certificate x509Cert)) {
                                 certsArray.add("Unknown certificate type" + cert.toString());
                             } else {
-                                X509Certificate x509Cert = (X509Certificate) cert;
-                                String subject = x509Cert.getSubjectDN().toString();
+                                String subject = x509Cert.getSubjectX500Principal().toString();
                                 JsonObject certObject = new JsonObject().add("subject", subject);
-                                String issuer = x509Cert.getIssuerDN().toString();
+                                String issuer = x509Cert.getIssuerX500Principal().toString();
                                 if (!issuer.equals(subject)) {
                                     certObject.add("issuer", issuer);
                                 }
@@ -299,7 +341,7 @@ public class Scanner implements Runnable {
                     rootArray.add(new JsonObject()
                             .add("path", jarPath.toString())
                             .add("valid", false)
-                            .add("error", checkResult.getError()));
+                            .add("error", checkResult.error()));
                 }
             } 
         }
@@ -309,57 +351,36 @@ public class Scanner implements Runnable {
     
     private static char[] fillSpaces(int count)
     {
+        if (count < 0) {
+            count = 0;
+        }
         char[] fillBuff = new char[count];
         Arrays.fill(fillBuff, ' ');
         return fillBuff;
     }
-    
-    private static class CheckResult implements Comparable<CheckResult> {
-        private final boolean isOk;
-        private final Path path;
-        private final Set<Certificate> certs;
-        private final String error;
 
-        private CheckResult(boolean isOk, Path path, Set<Certificate> certs, String error) {
-            this.isOk = isOk;
-            this.path = path;
-            this.certs = certs;
-            this.error = error;
-        }
+    private record CheckResult(boolean isOk, 
+                               Path path, 
+                               Set<Certificate> certs,
+                               String error) implements Comparable<CheckResult> {
 
-        public static CheckResult ok(Path path,  Set<Certificate> certs) {
-            return new CheckResult(true, path, certs, null);
-        }
-
-        public Path getPath() {
-            return path;
-        }
-
-        public static CheckResult fail(Path path, String error) {
-            return new CheckResult(false, path, Collections.emptySet(), error);
-        }
-
-        public boolean isOk() {
-            return isOk;
-        }
-
-        public Set<Certificate> getCerts() {
-            return certs;
-        }
-
-        public String getError() {
-            return error;
-        }
-
-        @Override
-        @SuppressWarnings("NullableProblems")
-        public int compareTo(CheckResult other) {
-            if (other == null) {
-                return -1;
+        public static CheckResult ok(Path path, Set<Certificate> certs) {
+                return new CheckResult(true, path, certs, null);
             }
-            return path.compareTo(other.getPath());
+    
+            public static CheckResult fail(Path path, String error) {
+                return new CheckResult(false, path, Collections.emptySet(), error);
+            }
+    
+            @Override
+            @SuppressWarnings("NullableProblems")
+            public int compareTo(CheckResult other) {
+                if (other == null) {
+                    return -1;
+                }
+                return path.compareTo(other.path());
+            }
         }
-    }
     
     private enum ShowOption {
         signed,
