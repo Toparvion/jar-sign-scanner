@@ -78,37 +78,25 @@ public class Scanner implements Callable<Integer> {
             return 1;
         }
 
-        Map<Path, CheckResult> path2Result;
-        int total = filesToCheck.size();
-        if (total > 10 && output == OutputOption.text) {
-            Timer timer = new Timer("ProgressTimer", true);
-            timer.scheduleAtFixedRate(new TimerTask() {
-                @Override
-                public void run() {
-                    printProgress(startTime, total);
-                }
-            }, 0, 250);
-        }
-        System.out.println();
-        path2Result = filesToCheck.stream()
+        setupProgressMonitor(filesToCheck.size(), startTime);
+        Map<Path, CheckResult> path2Result = filesToCheck.stream()
                 .parallel()
                 .map(this::checkForSignature)
                 .collect(collectingAndThen(
                         toMap(CheckResult::path, Function.identity()),
                         TreeMap::new));
-        if (output == OutputOption.text) {
-            System.out.println("\n");
-        }
 
         if (output == OutputOption.json) {
             composeResultsJson(path2Result);
         } else {
+            System.out.println("\n");       
             printCheckResults(path2Result);
             printStats(path2Result, startTime);
         }
         
         return 0;
     }
+    
     private List<Path> collectFilesToCheck(String[] args) {
         if (args.length < 1) {
             System.out.println("Specify directories and/or files to scan (separated by spaces). " +
@@ -194,6 +182,19 @@ public class Scanner implements Callable<Integer> {
                 e.printStackTrace(System.err);
             }
         }
+    }
+
+    private void setupProgressMonitor(int total, long startTime) {
+        if (total > 100 && output == OutputOption.text) {
+            Timer timer = new Timer("ProgressTimer", true);
+            timer.scheduleAtFixedRate(new TimerTask() {
+                @Override
+                public void run() {
+                    printProgress(startTime, total);
+                }
+            }, 0, 200);
+        }
+        System.out.println();
     }
 
     /**
@@ -296,8 +297,8 @@ public class Scanner implements Callable<Integer> {
         long failedCount = results.size() - successFulCount;
 
         var tookTime = System.currentTimeMillis() - startTime;
-        System.out.printf("Total %d JAR files scanned (in %dms): %d signed, %d not signed, %d unknown.\n",
-                results.size(), tookTime, signedCount, notSignedCount, failedCount);
+        System.out.printf("Total %d JAR files scanned: %d signed, %d not signed, %d unknown (took %d ms).\n",
+                results.size(), signedCount, notSignedCount, failedCount, tookTime);
     }
 
     private void composeResultsJson(Map<Path, CheckResult> results) {
