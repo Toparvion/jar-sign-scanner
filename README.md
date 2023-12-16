@@ -129,7 +129,7 @@ JSON result sample (for integrating into CI and/or tests):
 
 
 
-### Acknowledgments
+## Acknowledgments
 
 To stay small, simple yet capable, JarSignScanner incorporates the following great open source tools:
 
@@ -138,7 +138,7 @@ To stay small, simple yet capable, JarSignScanner incorporates the following gre
 
 
 
-### Feedback & contribution
+## Feedback & contribution
 
 Your feedback is very appreciated in any suitable way:
 * [create a pull request](https://github.com/Toparvion/jar-sign-scanner/compare) for missing/misbehaving features;
@@ -147,6 +147,6 @@ Your feedback is very appreciated in any suitable way:
 
 
 
-### Other tools
+## Other tools
 
 Refer to my other [GitHub projects](https://github.com/Toparvion) or [this web page](https://toparvion.pro/en/) to find more tools for JVM-based development & testing. 
